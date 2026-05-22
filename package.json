@@ -1,0 +1,38 @@
+{
+  "name": "@saketananddotme/adt",
+  "version": "1.0.0",
+  "description": "AI skill package manager for Cursor, Claude Code, and Codex",
+  "bin": {
+    "adt": "./bin/adt.js"
+  },
+  "files": [
+    "bin/",
+    "catalog.json",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "preuninstall": "node bin/adt.js uninstall --yes 2>/dev/null || true"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saketanand/ai-dev-toolkit"
+  },
+  "keywords": [
+    "ai",
+    "cursor",
+    "claude",
+    "codex",
+    "skills",
+    "agents",
+    "rules",
+    "developer-tools"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,19 @@
+# Repo-only — excluded from the published npm bundle
+.git/
+.github/
+scripts/
+graphify-out/
+evals/
+hooks/
+global/
+.aw/
+.cursor/
+.cursor-plugin/
+.claude-plugin/
+.codex-plugin/
+setup.sh
+CLAUDECODE.md
+CURSOR.md
+OPENCODE.md
+.DS_Store
+*.DS_Store
