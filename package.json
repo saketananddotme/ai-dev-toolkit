@@ -3,7 +3,7 @@
   "version": "1.0.1",
   "description": "AI skill package manager for Cursor, Claude Code, and Codex",
   "bin": {
-    "adt": "./bin/adt.js"
+    "adt": "bin/adt.js"
   },
   "files": [
     "bin/",
@@ -20,7 +20,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/saketanand/ai-dev-toolkit"
+    "url": "git+https://github.com/saketanand/ai-dev-toolkit.git"
   },
   "keywords": [
     "ai",
