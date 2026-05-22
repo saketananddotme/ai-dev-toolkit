@@ -21,24 +21,53 @@ const STATE_FILE = path.join(ADT_DIR, '.state.json');
 const REMOTE_CATALOG_FILE = path.join(ADT_DIR, 'catalog-remote.json');
 const LOCAL_CATALOG_FILE = path.join(PKG_DIR, 'catalog.json');
 
-const HARNESS_DIRS = {
-  cursor: {
-    rules: path.join(HOME, '.cursor', 'rules'),
-    skills: path.join(HOME, '.cursor', 'skills'),
-    agents: path.join(HOME, '.cursor', 'agents'),
-    hooks: path.join(HOME, '.cursor', 'hooks'),
-  },
-  claude: {
-    skills: path.join(HOME, '.claude', 'skills'),
-    agents: path.join(HOME, '.claude', 'agents'),
-    hooks: path.join(HOME, '.claude', 'hooks'),
-    claudeMd: path.join(HOME, '.claude', 'CLAUDE.md'),
-  },
-  codex: {
-    skills: path.join(HOME, '.codex', 'skills'),
-    agents: path.join(HOME, '.codex', 'agents'),
-  },
-};
+// Harness directory layouts.
+// Global scope writes to ~/.cursor/, ~/.claude/, ~/.codex/.
+// Project scope writes to <project>/.cursor/, <project>/.claude/, but Claude Code reads
+// project memory from <project>/CLAUDE.md (root-level), not <project>/.claude/CLAUDE.md.
+function globalHarnessDirs() {
+  return {
+    cursor: {
+      rules: path.join(HOME, '.cursor', 'rules'),
+      skills: path.join(HOME, '.cursor', 'skills'),
+      agents: path.join(HOME, '.cursor', 'agents'),
+      hooks: path.join(HOME, '.cursor', 'hooks'),
+    },
+    claude: {
+      skills: path.join(HOME, '.claude', 'skills'),
+      agents: path.join(HOME, '.claude', 'agents'),
+      hooks: path.join(HOME, '.claude', 'hooks'),
+      claudeMd: path.join(HOME, '.claude', 'CLAUDE.md'),
+    },
+    codex: {
+      skills: path.join(HOME, '.codex', 'skills'),
+      agents: path.join(HOME, '.codex', 'agents'),
+    },
+  };
+}
+
+function projectHarnessDirs(projectRoot) {
+  return {
+    cursor: {
+      rules: path.join(projectRoot, '.cursor', 'rules'),
+      skills: path.join(projectRoot, '.cursor', 'skills'),
+      agents: path.join(projectRoot, '.cursor', 'agents'),
+      hooks: path.join(projectRoot, '.cursor', 'hooks'),
+    },
+    claude: {
+      skills: path.join(projectRoot, '.claude', 'skills'),
+      agents: path.join(projectRoot, '.claude', 'agents'),
+      hooks: path.join(projectRoot, '.claude', 'hooks'),
+      claudeMd: path.join(projectRoot, 'CLAUDE.md'),
+    },
+    codex: {
+      skills: path.join(projectRoot, '.codex', 'skills'),
+      agents: path.join(projectRoot, '.codex', 'agents'),
+    },
+  };
+}
+
+const HARNESS_NAMES = ['cursor', 'claude', 'codex'];
 
 // Maps content type → harness → subdirectory key
 const TYPE_HARNESS_MAP = {
@@ -142,10 +171,7 @@ function formatBytes(bytes) {
 }
 
 function detectHarnesses() {
-  return Object.keys(HARNESS_DIRS).filter((h) => {
-    const base = path.join(HOME, `.${h}`);
-    return fs.existsSync(base);
-  });
+  return HARNESS_NAMES.filter((h) => fs.existsSync(path.join(HOME, `.${h}`)));
 }
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -168,22 +194,34 @@ function writeState(state) {
 }
 
 // ─── Manifest ─────────────────────────────────────────────────────────────────
-// .manifest.json: { version: 1, items: [{ path, source, type, name, contentHash? }] }
+// v2 schema:
+//   { version: 2, items: [{ path, source, type, name, harness, scope, projectRoot?, contentHash? }] }
+// scope is 'global' or 'project'. projectRoot is set only when scope === 'project'.
 
-const MANIFEST_VERSION = 1;
+const MANIFEST_VERSION = 2;
 
 function readManifest() {
   if (!fs.existsSync(MANIFEST_FILE)) return { version: MANIFEST_VERSION, items: [] };
+  let raw;
   try {
-    const raw = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'));
-    // Migrate if needed
-    if (!raw.version || raw.version < MANIFEST_VERSION) {
-      return { version: MANIFEST_VERSION, items: Array.isArray(raw.items) ? raw.items : [] };
-    }
-    return raw;
+    raw = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'));
   } catch {
     return { version: MANIFEST_VERSION, items: [] };
   }
+  const items = Array.isArray(raw.items) ? raw.items : [];
+  // Lazy v1 → v2 migration: pre-2.0 entries were always global.
+  let mutated = !raw.version || raw.version < MANIFEST_VERSION;
+  for (const item of items) {
+    if (!item.scope) {
+      item.scope = 'global';
+      mutated = true;
+    }
+  }
+  const manifest = { version: MANIFEST_VERSION, items };
+  if (mutated) {
+    try { writeManifest(manifest); } catch {}
+  }
+  return manifest;
 }
 
 function writeManifest(manifest) {
@@ -205,6 +243,96 @@ function removeManifestEntries(manifest, predicate) {
 
 function findManifestEntries(manifest, predicate) {
   return manifest.items.filter(predicate);
+}
+
+// ─── Scope detection ──────────────────────────────────────────────────────────
+// Walk up from cwd looking for a project marker.
+// First pass prefers .adt (explicit intent); second pass falls back to .git.
+// Never treat $HOME as a project root.
+
+function detectScope(cwd, opts = {}) {
+  if (opts.forceGlobal) return { kind: 'global' };
+  const start = path.resolve(cwd);
+  const passes = [
+    (dir) => fs.existsSync(path.join(dir, '.adt')),
+    // .git may be a directory or a file (worktrees) — existsSync handles both.
+    (dir) => fs.existsSync(path.join(dir, '.git')),
+  ];
+  for (const matches of passes) {
+    let cur = start;
+    while (true) {
+      if (cur === HOME) break;
+      if (matches(cur)) return { kind: 'project', root: cur };
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+    }
+  }
+  return { kind: 'global' };
+}
+
+function scopeContext(scope) {
+  if (scope.kind === 'global') {
+    return { kind: 'global', harnessDirs: globalHarnessDirs() };
+  }
+  return { kind: 'project', root: scope.root, harnessDirs: projectHarnessDirs(scope.root) };
+}
+
+// ─── Project config (.adt, jsonl) ─────────────────────────────────────────────
+
+function projectConfigPath(root) { return path.join(root, '.adt'); }
+
+function readProjectConfig(root) {
+  const file = projectConfigPath(root);
+  if (!fs.existsSync(file)) return [];
+  const lines = fs.readFileSync(file, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean);
+  const entries = [];
+  for (const line of lines) {
+    if (line.startsWith('#')) continue;
+    try { entries.push(JSON.parse(line)); } catch { /* skip malformed */ }
+  }
+  return entries;
+}
+
+function writeProjectConfig(root, entries) {
+  const file = projectConfigPath(root);
+  if (entries.length === 0) {
+    if (fs.existsSync(file)) fs.unlinkSync(file);
+    return;
+  }
+  const body = entries.map((e) => JSON.stringify(e)).join('\n') + '\n';
+  fs.writeFileSync(file, body);
+}
+
+function addProjectConfigEntry(root, entry) {
+  const entries = readProjectConfig(root);
+  const idx = entries.findIndex((e) => e.source === entry.source && (e.item || null) === (entry.item || null));
+  if (idx >= 0) entries[idx] = entry;
+  else entries.push(entry);
+  writeProjectConfig(root, entries);
+}
+
+function removeProjectConfigEntries(root, predicate) {
+  const entries = readProjectConfig(root);
+  const remaining = entries.filter((e) => !predicate(e));
+  writeProjectConfig(root, remaining);
+  return entries.length - remaining.length;
+}
+
+// ─── .gitignore management ────────────────────────────────────────────────────
+
+const GITIGNORE_BEGIN = '# BEGIN ADT';
+const GITIGNORE_END = '# END ADT';
+const GITIGNORE_DEFAULT_ENTRIES = ['.adt', '.claude/', '.cursor/', '.codex/'];
+
+function ensureGitignore(root, entries = GITIGNORE_DEFAULT_ENTRIES) {
+  const file = path.join(root, '.gitignore');
+  let existing = '';
+  if (fs.existsSync(file)) existing = fs.readFileSync(file, 'utf8');
+  if (existing.includes(GITIGNORE_BEGIN)) return false; // already managed
+  const block = `${existing && !existing.endsWith('\n') ? '\n' : ''}${GITIGNORE_BEGIN}\n${entries.join('\n')}\n${GITIGNORE_END}\n`;
+  fs.writeFileSync(file, existing + block);
+  return true;
 }
 
 // ─── Catalog ──────────────────────────────────────────────────────────────────
@@ -365,17 +493,19 @@ function removeSymlink(linkPath) {
   return false;
 }
 
-// Install one item into all configured harnesses
-// Returns { linked: string[], skipped: string[], collisions: string[], errors: string[] }
-function linkItemToHarnesses(item, harnesses) {
+// Install one item into all configured harnesses using the provided harness dir map.
+// harnessDirs is the output of globalHarnessDirs() or projectHarnessDirs(root).
+// Returns { linked: string[], skipped: string[], collisions: string[], errors: string[], destPaths: { [harness]: string } }
+function linkItemToHarnesses(item, harnesses, harnessDirs) {
   const linked = [], skipped = [], collisions = [], errors = [];
+  const destPaths = {};
   const typeMap = TYPE_HARNESS_MAP[item.type];
-  if (!typeMap) return { linked, skipped, collisions, errors };
+  if (!typeMap) return { linked, skipped, collisions, errors, destPaths };
 
   for (const harness of harnesses) {
     const subdirKey = typeMap[harness];
     if (!subdirKey) continue;
-    const harnessBase = HARNESS_DIRS[harness];
+    const harnessBase = harnessDirs[harness];
     if (!harnessBase) continue;
     const targetDir = harnessBase[subdirKey];
     if (!targetDir) continue;
@@ -384,6 +514,7 @@ function linkItemToHarnesses(item, harnesses) {
     const isFile = item.type === 'rule' || (item.type === 'agent' && !fs.lstatSync(item.srcPath).isDirectory());
     const destName = isFile ? path.basename(item.srcPath) : item.name;
     const destPath = path.join(targetDir, destName);
+    destPaths[harness] = destPath;
 
     const result = createSymlink(item.srcPath, destPath);
     if (result.ok && result.reason === 'created') linked.push(harness);
@@ -391,7 +522,7 @@ function linkItemToHarnesses(item, harnesses) {
     else if (result.reason === 'collision') collisions.push(harness);
     else errors.push(`${harness}: ${result.reason}`);
   }
-  return { linked, skipped, collisions, errors };
+  return { linked, skipped, collisions, errors, destPaths };
 }
 
 // ─── CLAUDE.md markers ────────────────────────────────────────────────────────
@@ -500,16 +631,19 @@ async function cloneOrPullSource(sourceName, repoUrl, ref = 'main') {
 
 // ─── Install / Remove ─────────────────────────────────────────────────────────
 
-// Returns list of installed items with warnings
-async function installSource(sourceName, harnesses, filterItem = null, autoYes = false) {
+// Create symlinks for items from a cloned source, scoped to either global or project.
+// scopeCtx: { kind: 'global'|'project', root?: string, harnessDirs: object }
+// Returns { results: { installed, skipped, collisions, errors }, discovered }
+async function applyLinks(sourceName, harnesses, scopeCtx, filterItem = null) {
   const sourceDir = getSourceDir(sourceName);
   if (!fs.existsSync(sourceDir)) {
-    throw new Error(`Source "${sourceName}" not cloned. Run: adt source add ${sourceName} <url>`);
+    throw new Error(`Source "${sourceName}" not installed locally. Run: adt install ${sourceName}`);
   }
 
   const discovered = discoverSource(sourceDir);
   const manifest = readManifest();
   const results = { installed: [], skipped: [], collisions: [], errors: [] };
+  const { kind: scope, root: projectRoot, harnessDirs } = scopeCtx;
 
   const allItems = [
     ...discovered.skills.map((s) => ({ ...s, type: 'skill', srcPath: s.path })),
@@ -521,25 +655,22 @@ async function installSource(sourceName, harnesses, filterItem = null, autoYes =
   for (const item of allItems) {
     if (filterItem && item.name !== filterItem) continue;
 
-    const { linked, skipped, collisions, errors } = linkItemToHarnesses(item, harnesses);
+    const { linked, skipped, collisions, errors, destPaths } = linkItemToHarnesses(item, harnesses, harnessDirs);
 
     if (linked.length > 0) {
-      // Record in manifest — one entry per harness link
       for (const harness of linked) {
-        const typeMap = TYPE_HARNESS_MAP[item.type];
-        const subdirKey = typeMap?.[harness];
-        const harnessBase = HARNESS_DIRS[harness];
-        if (!subdirKey || !harnessBase) continue;
-        const isFile = item.type === 'rule' || (item.type === 'agent' && !fs.lstatSync(item.srcPath).isDirectory());
-        const destName = isFile ? path.basename(item.srcPath) : item.name;
-        const destPath = path.join(harnessBase[subdirKey], destName);
-        addManifestEntry(manifest, {
+        const destPath = destPaths[harness];
+        if (!destPath) continue;
+        const entry = {
           path: destPath,
           source: sourceName,
           type: item.type,
           name: item.name,
           harness,
-        });
+          scope,
+        };
+        if (scope === 'project') entry.projectRoot = projectRoot;
+        addManifestEntry(manifest, entry);
       }
       results.installed.push({ name: `${sourceName}/${item.name}`, type: item.type, harnesses: linked });
     }
@@ -548,21 +679,30 @@ async function installSource(sourceName, harnesses, filterItem = null, autoYes =
     errors.forEach((e) => results.errors.push(e));
   }
 
-  // CLAUDE.md
-  if (discovered.hasCLAUDEMd && !filterItem) {
+  // CLAUDE.md — only when applying the whole source (not a single item filter)
+  if (discovered.hasCLAUDEMd && !filterItem && harnesses.includes('claude') && harnessDirs.claude?.claudeMd) {
     const claudeMdSrc = path.join(sourceDir, 'CLAUDE.md');
-    const existing = findManifestEntries(manifest, (i) => i.source === sourceName && i.type === 'claudemd');
-    if (existing.length === 0 && harnesses.includes('claude')) {
+    const claudeMdDest = harnessDirs.claude.claudeMd;
+    const manifestKey = `${claudeMdDest}#marker:${sourceName}`;
+    const existing = findManifestEntries(
+      manifest,
+      (i) => i.type === 'claudemd' && i.path === manifestKey,
+    );
+    if (existing.length === 0) {
       const content = fs.readFileSync(claudeMdSrc, 'utf8');
-      const insertResult = insertClaudeMdBlock(HARNESS_DIRS.claude.claudeMd, sourceName, content);
+      const insertResult = insertClaudeMdBlock(claudeMdDest, sourceName, content);
       if (!insertResult.already) {
-        addManifestEntry(manifest, {
-          path: `${HARNESS_DIRS.claude.claudeMd}#marker:${sourceName}`,
+        const entry = {
+          path: manifestKey,
           source: sourceName,
           type: 'claudemd',
           name: sourceName,
+          harness: 'claude',
+          scope,
           contentHash: insertResult.contentHash,
-        });
+        };
+        if (scope === 'project') entry.projectRoot = projectRoot;
+        addManifestEntry(manifest, entry);
         results.installed.push({ name: `${sourceName}/CLAUDE.md`, type: 'memory', harnesses: ['claude'] });
       } else {
         results.skipped.push(`${sourceName}/CLAUDE.md`);
@@ -642,7 +782,7 @@ async function cmdInit(args) {
     if (!autoYes) {
       console.log(`\n  Detected harnesses: ${detected.length ? detected.join(', ') : 'none'}`);
       const answer = await prompt(rl, `  Which harnesses to configure? (comma-separated)`, detected.join(', '));
-      harnesses = answer.split(',').map((s) => s.trim()).filter((h) => HARNESS_DIRS[h]);
+      harnesses = answer.split(',').map((s) => s.trim()).filter((h) => HARNESS_NAMES.includes(h));
     }
 
     if (harnesses.length === 0) {
@@ -662,18 +802,22 @@ async function cmdInit(args) {
     console.log(`  Available sources: ${sourceNames.join(', ')}`);
 
     if (!autoYes) {
-      const toInstall = await prompt(rl, '  Install any sources now? (space or comma-separated names, or Enter to skip)', '');
+      const toInstall = await prompt(rl, '  Install + use globally now? (space or comma-separated names, or Enter to skip)', '');
       const names = toInstall.split(/[\s,]+/).filter(Boolean);
       for (const name of names) {
         if (!catalog[name]) { warn(`Unknown source: ${name}. Use "adt source add ${name} <url>" to add custom sources.`); continue; }
-        await cmdSourceAdd([name, catalog[name].repo, catalog[name].ref || 'main'], true);
-        await cmdInstall([name], true);
+        try {
+          await cloneOrPullSource(name, catalog[name].repo, catalog[name].ref || 'main');
+          ok(`Installed source "${name}"`);
+        } catch (e) { err(`Failed to install ${name}: ${e.message}`); continue; }
+        await cmdUse([name, '--global']);
       }
     }
 
     console.log(`\n${C.green}${C.bold}Init complete.${C.reset}`);
-    info('Add custom sources:  adt source add <name> <url>');
-    info('Install a source:    adt install <source>');
+    info('Install a source:    adt install <source>      (clones it locally)');
+    info('Activate globally:   adt use --global <source>');
+    info('Activate in project: cd to project, then adt use <source>');
     info('List installed:      adt list --installed');
   } finally {
     if (rl) rl.close();
@@ -715,8 +859,28 @@ async function cmdSourceRemove(args) {
   if (!name) { console.log('\nUsage: adt source remove <name>\n'); process.exit(1); }
   header(`ADT — source remove "${name}"`);
 
-  // Remove installed items from this source
+  // Collect affected project roots before deletion for transparency.
+  const manifestBefore = readManifest();
+  const projectRoots = [
+    ...new Set(
+      manifestBefore.items
+        .filter((i) => i.source === name && i.scope === 'project' && i.projectRoot)
+        .map((i) => i.projectRoot),
+    ),
+  ];
+
+  // Remove all installed items for this source across every scope.
   await removeItems((i) => i.source === name, true);
+
+  // Drop .adt entries from each project root we touched.
+  for (const root of projectRoots) {
+    if (!fs.existsSync(root)) continue;
+    removeProjectConfigEntries(root, (e) => e.source === name);
+  }
+  if (projectRoots.length > 0) {
+    info(`Cleaned project symlinks across ${projectRoots.length} root(s):`);
+    projectRoots.forEach((r) => info(`  ${r}`));
+  }
 
   // Remove cloned dir
   const sourceDir = getSourceDir(name);
@@ -781,86 +945,176 @@ async function cmdSource(args) {
   }
 }
 
-// ─── Command: install ─────────────────────────────────────────────────────────
+// ─── Command: install (clone only — does NOT create symlinks) ────────────────
 
 async function cmdInstall(args, silent = false) {
   const target = args[0];
-  if (!target) { console.log('\nUsage: adt install <source> | adt install <source>/<item>\n'); process.exit(1); }
+  if (!target) { console.log('\nUsage: adt install <source>\n'); process.exit(1); }
 
-  // Edge case #1: auto-init if no state
+  // Bare source name only — `install` is for making the source available.
+  // Use `adt use <source>[/<item>]` afterwards to activate.
+  if (target.includes('/')) {
+    err('`adt install` takes a source name only. To activate a single item, run: adt use <source>/<item>');
+    process.exit(1);
+  }
+  const sourceName = target;
+
+  if (!silent) header(`ADT — install "${sourceName}"`);
+
   const state = readState();
-  if (state.harnesses.length === 0) {
-    if (!silent) info('No harnesses configured. Running init first...');
-    await cmdInit(['--yes']);
-    return cmdInstall(args, silent);
-  }
-  const harnesses = state.harnesses;
-
-  const [sourceName, itemName] = target.includes('/') ? target.split('/') : [target, null];
-
-  if (!silent) header(`ADT — install "${target}"`);
-
-  const catalog = await getCatalog({ offlineOnly: true });
-
-  // Ensure source is cloned
-  if (!fs.existsSync(getSourceDir(sourceName))) {
-    const src = catalog[sourceName] || state.userSources?.[sourceName];
-    if (!src) {
-      err(`Unknown source "${sourceName}". Add it first: adt source add ${sourceName} <url>`);
-      process.exit(1);
-    }
-    try {
-      await cloneOrPullSource(sourceName, src.repo, src.ref || 'main');
-    } catch (e) {
-      err(`Cannot clone source "${sourceName}": ${e.message}`);
-      process.exit(1);
-    }
+  const catalog = await getCatalog({ offlineOnly: false });
+  const src = catalog[sourceName] || state.userSources?.[sourceName];
+  if (!src) {
+    err(`Unknown source "${sourceName}". Add it first: adt source add ${sourceName} <url>`);
+    process.exit(1);
   }
 
-  const { results } = await installSource(sourceName, harnesses, itemName, false);
+  try {
+    const r = await cloneOrPullSource(sourceName, src.repo, src.ref || 'main');
+    ok(`Source "${sourceName}" ${r.action} → ${r.dir}`);
+  } catch (e) {
+    err(`Cannot install "${sourceName}": ${e.message}`);
+    process.exit(1);
+  }
 
-  // Report
-  for (const item of results.installed) {
-    ok(`${item.name} (${item.type}) → ${item.harnesses.join(', ')}`);
-  }
-  for (const s of results.skipped) {
-    skip(s);
-  }
-  for (const c of results.collisions) {
-    warn(`${c.item} — collision in ${c.harness} (real file exists, skipped)`);
-  }
-  for (const e of results.errors) {
-    err(e);
-  }
+  const discovered = discoverSource(getSourceDir(sourceName));
+  info(`Discovered: ${discovered.skills.length} skills, ${discovered.agents.length} agents, ${discovered.rules.length} rules, ${discovered.hooks.length} hooks${discovered.hasCLAUDEMd ? ', 1 CLAUDE.md' : ''}`);
 
   if (!silent) {
-    const count = results.installed.length;
-    const skippedCount = results.skipped.length;
-    const msg = [
-      count > 0 ? `${count} installed` : '',
-      skippedCount > 0 ? `${skippedCount} already present` : '',
-    ].filter(Boolean).join(', ');
-    console.log(`\n  ${C.green}Done.${C.reset} ${msg || 'Nothing new to install.'}`);
+    console.log(`\n  ${C.green}Done.${C.reset} Activate with:`);
+    info(`  adt use ${sourceName}            (project scope if inside a project, else global)`);
+    info(`  adt use --global ${sourceName}   (force global)`);
   }
 }
 
-// ─── Command: remove ──────────────────────────────────────────────────────────
+// ─── Command: use / unuse ─────────────────────────────────────────────────────
 
-async function cmdRemove(args) {
-  const target = args[0];
-  if (!target) { console.log('\nUsage: adt remove <source> | adt remove <source>/<item>\n'); process.exit(1); }
-  header(`ADT — remove "${target}"`);
+function parseScopeArgs(args) {
+  const forceGlobal = args.includes('--global') || args.includes('-g');
+  const positional = args.filter((a) => !a.startsWith('-'));
+  return { forceGlobal, positional };
+}
+
+function harnessesForScope(scopeCtx, state) {
+  // Always use the user's configured global harness list as the set to wire up.
+  // For project scope this rewires the same harnesses but rooted in the project dir.
+  if (state.harnesses && state.harnesses.length > 0) return state.harnesses;
+  // Fall back to detection if state was never configured.
+  return detectHarnesses();
+}
+
+async function cmdUse(args) {
+  const { forceGlobal, positional } = parseScopeArgs(args);
+  const target = positional[0];
+
+  // Auto-init harnesses on first use
+  const stateInit = readState();
+  if (stateInit.harnesses.length === 0) {
+    info('No harnesses configured. Running init first...');
+    await cmdInit(['--yes']);
+  }
+  const state = readState();
+  const scope = detectScope(process.cwd(), { forceGlobal });
+  const ctx = scopeContext(scope);
+  const harnesses = harnessesForScope(ctx, state);
+
+  // Bootstrap mode: `adt use` with no args inside a project replays .adt
+  if (!target) {
+    if (scope.kind !== 'project') {
+      console.log('\nUsage: adt use <source>[/<item>] [--global]\n');
+      console.log('Run inside a project directory with no args to re-apply its .adt entries.');
+      process.exit(1);
+    }
+    const entries = readProjectConfig(scope.root);
+    if (entries.length === 0) {
+      info(`No .adt entries in ${scope.root}. Add some with: adt use <source>`);
+      return;
+    }
+    header(`ADT — use (bootstrap from .adt in ${scope.root})`);
+    for (const entry of entries) {
+      await applyAndReport(entry.source, entry.item || null, ctx, harnesses, scope, /*writeConfig*/ false);
+    }
+    return;
+  }
 
   const [sourceName, itemName] = target.includes('/') ? target.split('/') : [target, null];
-  const predicate = itemName
-    ? (i) => i.source === sourceName && i.name === itemName
-    : (i) => i.source === sourceName;
+
+  if (!fs.existsSync(getSourceDir(sourceName))) {
+    err(`Source "${sourceName}" is not installed locally. Run: adt install ${sourceName}`);
+    process.exit(1);
+  }
+
+  header(`ADT — use "${target}" (${scope.kind}${scope.kind === 'project' ? `: ${scope.root}` : ''})`);
+  await applyAndReport(sourceName, itemName, ctx, harnesses, scope, /*writeConfig*/ true);
+}
+
+async function applyAndReport(sourceName, itemName, ctx, harnesses, scope, writeConfig) {
+  const { results } = await applyLinks(sourceName, harnesses, ctx, itemName);
+
+  for (const item of results.installed) {
+    ok(`${item.name} (${item.type}) → ${item.harnesses.join(', ')}`);
+  }
+  for (const s of results.skipped) skip(s);
+  for (const c of results.collisions) {
+    warn(`${c.item} — collision in ${c.harness} (real file exists, skipped)`);
+  }
+  for (const e of results.errors) err(e);
+
+  if (scope.kind === 'project' && writeConfig) {
+    const entry = { source: sourceName, added: new Date().toISOString() };
+    if (itemName) entry.item = itemName;
+    addProjectConfigEntry(scope.root, entry);
+    const wroteGitignore = ensureGitignore(scope.root);
+    if (wroteGitignore) info(`Added ADT block to ${path.join(scope.root, '.gitignore')}`);
+  }
+
+  const count = results.installed.length;
+  const skippedCount = results.skipped.length;
+  const msg = [
+    count > 0 ? `${count} linked` : '',
+    skippedCount > 0 ? `${skippedCount} already active` : '',
+  ].filter(Boolean).join(', ');
+  console.log(`  ${C.green}${sourceName}: ${msg || 'nothing new'}${C.reset}`);
+}
+
+async function cmdUnuse(args) {
+  const { forceGlobal, positional } = parseScopeArgs(args);
+  const target = positional[0];
+  if (!target) { console.log('\nUsage: adt unuse <source>[/<item>] [--global]\n'); process.exit(1); }
+
+  const scope = detectScope(process.cwd(), { forceGlobal });
+  const [sourceName, itemName] = target.includes('/') ? target.split('/') : [target, null];
+
+  header(`ADT — unuse "${target}" (${scope.kind}${scope.kind === 'project' ? `: ${scope.root}` : ''})`);
+
+  const predicate = (i) => {
+    if (i.source !== sourceName) return false;
+    if (itemName && i.name !== itemName) return false;
+    if (scope.kind === 'global') return i.scope === 'global';
+    return i.scope === 'project' && i.projectRoot === scope.root;
+  };
 
   const { removed, errors } = await removeItems(predicate);
-
   removed.forEach((p) => ok(`Removed: ${path.basename(p)}`));
   errors.forEach((p) => warn(`Could not remove: ${path.basename(p)}`));
+
+  if (scope.kind === 'project') {
+    const dropped = removeProjectConfigEntries(scope.root, (e) => {
+      if (e.source !== sourceName) return false;
+      if (itemName && e.item !== itemName) return false;
+      return true;
+    });
+    if (dropped > 0) info(`Removed ${dropped} entry/entries from ${projectConfigPath(scope.root)}`);
+  }
+
   console.log(`\n  ${C.green}Done.${C.reset} ${removed.length} item(s) removed.`);
+}
+
+// ─── Command: remove (deprecated alias for unuse) ─────────────────────────────
+
+async function cmdRemove(args) {
+  warn('`adt remove` is deprecated. Use `adt unuse` instead.');
+  return cmdUnuse(args);
 }
 
 // ─── Command: update ──────────────────────────────────────────────────────────
@@ -875,18 +1129,53 @@ async function cmdUpdate() {
 
 async function cmdList(args) {
   const installedOnly = args.includes('--installed');
+  const globalOnly = args.includes('--global');
+  const projectOnly = args.includes('--project');
   const targetSource = args.find((a) => !a.startsWith('-'));
 
+  // Sources downloaded locally (regardless of activation)
   if (installedOnly) {
-    header('ADT — installed items');
-    const manifest = readManifest();
-    if (manifest.items.length === 0) {
+    header('ADT — installed sources (downloaded)');
+    if (!fs.existsSync(SOURCES_DIR)) {
       info('Nothing installed. Run: adt install <source>');
       return;
     }
-    // Group by source → name → collect harnesses
+    const sources = fs.readdirSync(SOURCES_DIR).filter((n) => {
+      try { return fs.lstatSync(path.join(SOURCES_DIR, n)).isDirectory(); } catch { return false; }
+    });
+    if (sources.length === 0) {
+      info('Nothing installed. Run: adt install <source>');
+      return;
+    }
+    for (const name of sources) {
+      const d = discoverSource(path.join(SOURCES_DIR, name));
+      const parts = [];
+      if (d.skills.length) parts.push(`${d.skills.length} skills`);
+      if (d.agents.length) parts.push(`${d.agents.length} agents`);
+      if (d.rules.length) parts.push(`${d.rules.length} rules`);
+      if (d.hooks.length) parts.push(`${d.hooks.length} hooks`);
+      if (d.hasCLAUDEMd) parts.push('CLAUDE.md');
+      console.log(`  ${C.bold}${name}${C.reset} ${C.dim}— ${parts.join(', ') || 'empty'}${C.reset}`);
+    }
+    return;
+  }
+
+  // Activations (scope-filtered)
+  if (globalOnly || projectOnly) {
+    const scopeNow = projectOnly ? detectScope(process.cwd()) : { kind: 'global' };
+    if (projectOnly && scopeNow.kind !== 'project') {
+      info('Not inside a project directory. Run from a project root, or use --global.');
+      return;
+    }
+    header(`ADT — active${globalOnly ? ' (global)' : ` (project: ${scopeNow.root})`}`);
+    const manifest = readManifest();
+    const filtered = manifest.items.filter((i) => {
+      if (globalOnly) return i.scope === 'global';
+      return i.scope === 'project' && i.projectRoot === scopeNow.root;
+    });
+    if (filtered.length === 0) { info('Nothing active in this scope.'); return; }
     const bySource = {};
-    for (const item of manifest.items) {
+    for (const item of filtered) {
       const key = `${item.type}:${item.name}`;
       bySource[item.source] = bySource[item.source] || {};
       if (!bySource[item.source][key]) {
@@ -943,15 +1232,19 @@ async function cmdStatus() {
   header('ADT — status');
   const state = readState();
   const manifest = readManifest();
+  const scope = detectScope(process.cwd());
 
-  console.log(`\n  ${C.bold}Harnesses:${C.reset} ${state.harnesses.length ? state.harnesses.join(', ') : 'none configured'}`);
+  console.log(`\n  ${C.bold}Current scope:${C.reset} ${scope.kind === 'project' ? `project (${scope.root})` : 'global'}`);
+  console.log(`  ${C.bold}Harnesses:${C.reset} ${state.harnesses.length ? state.harnesses.join(', ') : 'none configured'}`);
 
-  const bySource = {};
-  for (const item of manifest.items) {
-    bySource[item.source] = (bySource[item.source] || 0) + 1;
+  // Globally active
+  const globalItems = manifest.items.filter((i) => i.scope === 'global');
+  const globalBySource = {};
+  for (const item of globalItems) {
+    globalBySource[item.source] = (globalBySource[item.source] || 0) + 1;
   }
-  console.log(`\n  ${C.bold}Installed:${C.reset} ${manifest.items.length} items across ${Object.keys(bySource).length} source(s)`);
-  for (const [src, count] of Object.entries(bySource)) {
+  console.log(`\n  ${C.bold}Globally active:${C.reset} ${globalItems.length} item(s) across ${Object.keys(globalBySource).length} source(s)`);
+  for (const [src, count] of Object.entries(globalBySource)) {
     const sourceDir = getSourceDir(src);
     let health = `${C.dim}not cloned${C.reset}`;
     if (fs.existsSync(sourceDir)) {
@@ -959,6 +1252,32 @@ async function cmdStatus() {
       health = gitLog.stdout.trim() ? `last pulled ${gitLog.stdout.trim()}` : 'cloned';
     }
     console.log(`    ${src}: ${count} items — ${health}`);
+  }
+
+  // Project active (current scope only)
+  if (scope.kind === 'project') {
+    const projectItems = manifest.items.filter((i) => i.scope === 'project' && i.projectRoot === scope.root);
+    const byProjSource = {};
+    for (const item of projectItems) {
+      byProjSource[item.source] = (byProjSource[item.source] || 0) + 1;
+    }
+    console.log(`\n  ${C.bold}Project active:${C.reset} ${projectItems.length} item(s) across ${Object.keys(byProjSource).length} source(s)`);
+    for (const [src, count] of Object.entries(byProjSource)) {
+      console.log(`    ${src}: ${count} items`);
+    }
+    const cfgPath = projectConfigPath(scope.root);
+    if (fs.existsSync(cfgPath)) info(`Config: ${cfgPath}`);
+  }
+
+  // Project roots touched (other than current)
+  const otherRoots = [...new Set(
+    manifest.items
+      .filter((i) => i.scope === 'project' && i.projectRoot && i.projectRoot !== scope.root)
+      .map((i) => i.projectRoot),
+  )];
+  if (otherRoots.length > 0) {
+    console.log(`\n  ${C.bold}Other project roots with ADT links:${C.reset}`);
+    otherRoots.forEach((r) => info(r));
   }
 
   const adtSize = diskSize(ADT_DIR);
@@ -1028,6 +1347,8 @@ const [,, cmd, ...rest] = process.argv;
       case 'init':      await cmdInit(rest); break;
       case 'source':    await cmdSource(rest); break;
       case 'install':   await cmdInstall(rest); break;
+      case 'use':       await cmdUse(rest); break;
+      case 'unuse':     await cmdUnuse(rest); break;
       case 'remove':    await cmdRemove(rest); break;
       case 'update':    await cmdUpdate(); break;
       case 'list':      await cmdList(rest); break;
@@ -1035,36 +1356,46 @@ const [,, cmd, ...rest] = process.argv;
       case 'uninstall': await cmdUninstall(rest); break;
       default:
         console.log(`
-${C.bold}adt${C.reset} — AI skill package manager
+${C.bold}adt${C.reset} — AI skill package manager (nvm-style)
 
 ${C.cyan}Setup:${C.reset}
-  adt init                          Interactive setup: harnesses + first sources
+  adt init                          Interactive setup: detect harnesses, configure
   adt init --yes                    Non-interactive (detect defaults)
 
 ${C.cyan}Sources:${C.reset}
   adt source add <name> <url>       Add a git repo as a source
-  adt source remove <name>          Remove a source
+  adt source remove <name>          Remove a source (everywhere — global + projects)
   adt source list                   List all sources
   adt source update [name]          Pull latest from upstream
 
-${C.cyan}Skills, agents, rules, hooks:${C.reset}
-  adt install <source>              Install all items from a source
-  adt install <source>/<item>       Install one item
-  adt remove <source>               Remove all items from a source
-  adt remove <source>/<item>        Remove one item
-  adt update                        Pull all sources and re-link
+${C.cyan}Install (download):${C.reset}
+  adt install <source>              Clone source to ~/.adt/sources/ (no symlinks yet)
+
+${C.cyan}Use (activate):${C.reset}
+  adt use <source>                  Activate — project scope if in a project, else global
+  adt use <source>/<item>           Activate just one skill/agent/rule
+  adt use --global <source>         Force global activation from anywhere
+  adt use                           (in a project) Re-apply entries from .adt
+  adt unuse <source>[/<item>]       Deactivate (scope-aware; --global to override)
+  adt update                        Pull all sources and repair broken links
 
 ${C.cyan}Inspect:${C.reset}
   adt list                          Show all available items (by source)
   adt list <source>                 Show items in one source
-  adt list --installed              Show only installed items
-  adt status                        Show harness config and install summary
+  adt list --installed              Show downloaded sources
+  adt list --global                 Show globally-active items
+  adt list --project                Show items active in the current project
+  adt status                        Show scope + active items (global + project)
 
 ${C.cyan}Uninstall:${C.reset}
   adt uninstall                     Interactive: remove everything ADT created
 
-${C.cyan}Install:${C.reset}
+${C.cyan}Install adt itself:${C.reset}
   npm install -g @saketananddotme/adt
+
+${C.dim}Tip: scope is auto-detected. Inside a git repo or a directory with a .adt file,
+\`adt use foo\` writes project-local symlinks and updates .adt. Anywhere else it
+activates globally. The .adt file is personal — it's auto-added to .gitignore.${C.reset}
 `);
     }
   } catch (e) {
