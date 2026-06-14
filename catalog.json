@@ -1,6 +1,7 @@
 {
   "version": 1,
   "remote_url": "https://raw.githubusercontent.com/saketananddotme/adt-catalog/main/catalog.json",
+  "skipBuckets": ["deprecated", "in-progress"],
   "sources": {
     "obra": {
       "repo": "https://github.com/obra/superpowers.git",

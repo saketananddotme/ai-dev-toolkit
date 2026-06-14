@@ -1,6 +1,6 @@
 {
   "name": "@saketananddotme/adt",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "AI skill package manager for Cursor, Claude Code, and Codex",
   "bin": {
     "adt": "bin/adt.js"

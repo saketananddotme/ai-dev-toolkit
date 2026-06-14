@@ -130,13 +130,15 @@ ADT auto-discovers content in any git repo using these conventions:
 
 ```
 your-skill-repo/
-├── skills/           # dirs with SKILL.md → installed as skills
+├── skills/           # any dir containing SKILL.md (recursive) → installed as skill
 ├── agents/           # .md files → installed as agents
 ├── rules/            # .mdc files (recursive) → installed as rules (Cursor only)
 ├── hooks/            # hook scripts/dirs → installed as hooks
 └── CLAUDE.md         # appended as a marker block in ~/.claude/CLAUDE.md (global)
                      #   or <project>/CLAUDE.md (project scope)
 ```
+
+`skills/` is walked recursively, so bucketed layouts like `skills/<bucket>/<name>/SKILL.md` work the same as flat `skills/<name>/SKILL.md`. Bucket folders listed in `catalog.json` under `skipBuckets` (default: `deprecated`, `in-progress`) are pruned — useful for repos that keep archived or unfinished skills next to live ones.
 
 No special config needed. ADT scans for these directories automatically.
 
@@ -159,19 +161,6 @@ Git worktrees work naturally — each worktree has its own `.git` file and can h
 - **Collision-safe.** If a real (non-symlink) file exists at the destination, ADT warns and skips.
 - **Layered.** A source can be active globally and project-locally at the same time — they live in different directories and don't conflict.
 - **Auto-gitignore.** First project `adt use` writes a managed `# BEGIN ADT … # END ADT` block to `.gitignore`. ADT never edits between those markers afterwards — you can change them however you like.
-- **Lazy migration.** Upgrading from 1.x to 2.0 silently rewrites the manifest to v2 on first read. Pre-2.0 installs become `scope: global` automatically.
-
-## Upgrading from 1.x
-
-`adt install <source>` no longer creates symlinks — it just clones. To restore the old behavior of "download AND activate globally", run:
-
-```bash
-adt install <source>
-adt use --global <source>
-```
-
-Existing symlinks from 1.x continue to work without any user action.
-
 ## Runtime directory
 
 ```

@@ -78,6 +78,7 @@ const TYPE_HARNESS_MAP = {
 };
 
 const CATALOG_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const DEFAULT_SKIP_BUCKETS = ['deprecated', 'in-progress'];
 
 // ─── Colours ─────────────────────────────────────────────────────────────────
 
@@ -194,34 +195,21 @@ function writeState(state) {
 }
 
 // ─── Manifest ─────────────────────────────────────────────────────────────────
-// v2 schema:
-//   { version: 2, items: [{ path, source, type, name, harness, scope, projectRoot?, contentHash? }] }
+// Schema:
+//   { version, items: [{ path, source, type, name, harness, scope, projectRoot?, contentHash? }] }
 // scope is 'global' or 'project'. projectRoot is set only when scope === 'project'.
 
 const MANIFEST_VERSION = 2;
 
 function readManifest() {
   if (!fs.existsSync(MANIFEST_FILE)) return { version: MANIFEST_VERSION, items: [] };
-  let raw;
   try {
-    raw = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'));
+    const items = Array.isArray(raw.items) ? raw.items : [];
+    return { version: MANIFEST_VERSION, items };
   } catch {
     return { version: MANIFEST_VERSION, items: [] };
   }
-  const items = Array.isArray(raw.items) ? raw.items : [];
-  // Lazy v1 → v2 migration: pre-2.0 entries were always global.
-  let mutated = !raw.version || raw.version < MANIFEST_VERSION;
-  for (const item of items) {
-    if (!item.scope) {
-      item.scope = 'global';
-      mutated = true;
-    }
-  }
-  const manifest = { version: MANIFEST_VERSION, items };
-  if (mutated) {
-    try { writeManifest(manifest); } catch {}
-  }
-  return manifest;
 }
 
 function writeManifest(manifest) {
@@ -385,25 +373,38 @@ async function getCatalog(opts = {}) {
 
 // ─── Auto-discovery ───────────────────────────────────────────────────────────
 
+function loadSkipBuckets() {
+  const local = loadLocalCatalog();
+  return new Set(Array.isArray(local.skipBuckets) ? local.skipBuckets : DEFAULT_SKIP_BUCKETS);
+}
+
+function scanSkills(dir, out, skipBuckets) {
+  // A directory with SKILL.md *is* the skill; don't recurse further.
+  if (fs.existsSync(path.join(dir, 'SKILL.md'))) {
+    const name = path.basename(dir);
+    if (!out.find((s) => s.name === name)) out.push({ name, path: dir });
+    return;
+  }
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch { return; }
+  for (const entry of entries) {
+    if (skipBuckets.has(entry)) continue;
+    const full = path.join(dir, entry);
+    try {
+      if (fs.lstatSync(full).isDirectory()) scanSkills(full, out, skipBuckets);
+    } catch {}
+  }
+}
+
 function discoverSource(sourceDir) {
   const result = { skills: [], agents: [], rules: [], hooks: [], hasCLAUDEMd: false };
   if (!fs.existsSync(sourceDir)) return result;
 
-  // Skills: directories containing SKILL.md (recursive up to 2 levels)
-  for (const base of ['skills', 'skills/engineering', '']) {
-    const dir = base ? path.join(sourceDir, base) : sourceDir;
-    if (!fs.existsSync(dir)) continue;
-    for (const entry of fs.readdirSync(dir)) {
-      const full = path.join(dir, entry);
-      const stat = fs.lstatSync(full);
-      if (stat.isDirectory() && fs.existsSync(path.join(full, 'SKILL.md'))) {
-        // Avoid duplicates
-        if (!result.skills.find((s) => s.name === entry)) {
-          result.skills.push({ name: entry, path: full });
-        }
-      }
-    }
-  }
+  // Skills: recursively walk skills/ for any directory containing SKILL.md.
+  // Bucket folders listed in catalog.skipBuckets (e.g. deprecated, in-progress) are pruned.
+  const skipBuckets = loadSkipBuckets();
+  const skillsDir = path.join(sourceDir, 'skills');
+  if (fs.existsSync(skillsDir)) scanSkills(skillsDir, result.skills, skipBuckets);
 
   // Agents: .md files in agents/
   const agentsDir = path.join(sourceDir, 'agents');
