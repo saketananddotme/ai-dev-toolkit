@@ -1,6 +1,6 @@
 # adt — AI skill package manager
 
-A package manager for AI skills, agents, rules, and hooks — for Cursor, Claude Code, and Codex.
+A package manager for AI skills, agents, commands, rules, and hooks — for Cursor, Claude Code, and Codex.
 
 Think `nvm` for AI skills: **install** any skill source from a git repo, then **use** it globally or just inside one project. Different projects can have different skills active without polluting your global setup.
 
@@ -105,6 +105,10 @@ adt list --installed              Sources downloaded on this machine
 adt list --global                 Items currently active globally
 adt list --project                Items currently active in this project
 adt status                        Detected scope + global + project summary
+adt info <source>                 Metadata, content counts, and activation status
+adt outdated                      Show sources that have upstream updates
+adt pin <source> [ref]            Lock a source to its current commit (or a ref)
+adt unpin <source>                Remove the pin — source will update normally again
 ```
 
 ### Uninstall
@@ -120,9 +124,9 @@ adt uninstall                     Interactive: removes every symlink, every .adt
 | Name | Repo | Content |
 |---|---|---|
 | `obra` | [obra/superpowers](https://github.com/obra/superpowers) | 14 skills for rapid prototyping |
-| `addy` | [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills) | Skills for codebase safety |
-| `matt` | [mattpocock/skills](https://github.com/mattpocock/skills) | Daily debugging shortcuts |
-| `karpathy` | [multica-ai/andrej-karpathy-skills](https://github.com/multica-ai/andrej-karpathy-skills) | Karpathy-style guidelines |
+| `addy` | [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills) | 23 skills, 3 agents, 7 commands |
+| `matt` | [mattpocock/skills](https://github.com/mattpocock/skills) | 20 skills for daily debugging |
+| `karpathy` | [multica-ai/andrej-karpathy-skills](https://github.com/multica-ai/andrej-karpathy-skills) | Karpathy-style coding guidelines |
 
 ## How source repos are structured
 
@@ -130,12 +134,14 @@ ADT auto-discovers content in any git repo using these conventions:
 
 ```
 your-skill-repo/
-├── skills/           # any dir containing SKILL.md (recursive) → installed as skill
-├── agents/           # .md files → installed as agents
-├── rules/            # .mdc files (recursive) → installed as rules (Cursor only)
-├── hooks/            # hook scripts/dirs → installed as hooks
-└── CLAUDE.md         # appended as a marker block in ~/.claude/CLAUDE.md (global)
-                     #   or <project>/CLAUDE.md (project scope)
+├── skills/              # any dir containing SKILL.md (recursive) → installed as skill
+├── agents/              # .md files → installed as agents
+├── commands/            # .md or .toml files → installed as slash commands (Claude Code)
+├── .claude/commands/    # alternate location for slash commands (also scanned)
+├── rules/               # .mdc files (recursive) → installed as rules (Cursor only)
+├── hooks/               # hook scripts/dirs → installed as hooks
+└── CLAUDE.md            # appended as a marker block in ~/.claude/CLAUDE.md (global)
+                        #   or <project>/CLAUDE.md (project scope)
 ```
 
 `skills/` is walked recursively, so bucketed layouts like `skills/<bucket>/<name>/SKILL.md` work the same as flat `skills/<name>/SKILL.md`. Bucket folders listed in `catalog.json` under `skipBuckets` (default: `deprecated`, `in-progress`) are pruned — useful for repos that keep archived or unfinished skills next to live ones.
@@ -174,9 +180,10 @@ Git worktrees work naturally — each worktree has its own `.git` file and can h
 Project-local files:
 ```
 <project>/
-├── .adt                  # Personal project config (jsonl). Never committed.
-├── .gitignore            # Auto-amended with ADT-managed block
-├── .claude/skills/...    # Project-local symlinks created by `adt use`
+├── .adt                    # Personal project config (jsonl). Never committed.
+├── .gitignore              # Auto-amended with ADT-managed block
+├── .claude/skills/...      # Project-local symlinks created by `adt use`
+├── .claude/commands/...    # Slash command symlinks (Claude Code)
 ├── .cursor/rules/...
-└── CLAUDE.md             # Project memory block (if source has CLAUDE.md)
+└── CLAUDE.md               # Project memory block (if source has CLAUDE.md)
 ```
