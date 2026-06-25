@@ -37,6 +37,7 @@ function globalHarnessDirs() {
       skills: path.join(HOME, '.claude', 'skills'),
       agents: path.join(HOME, '.claude', 'agents'),
       hooks: path.join(HOME, '.claude', 'hooks'),
+      commands: path.join(HOME, '.claude', 'commands'),
       claudeMd: path.join(HOME, '.claude', 'CLAUDE.md'),
     },
     codex: {
@@ -58,6 +59,7 @@ function projectHarnessDirs(projectRoot) {
       skills: path.join(projectRoot, '.claude', 'skills'),
       agents: path.join(projectRoot, '.claude', 'agents'),
       hooks: path.join(projectRoot, '.claude', 'hooks'),
+      commands: path.join(projectRoot, '.claude', 'commands'),
       claudeMd: path.join(projectRoot, 'CLAUDE.md'),
     },
     codex: {
@@ -71,10 +73,11 @@ const HARNESS_NAMES = ['cursor', 'claude', 'codex'];
 
 // Maps content type → harness → subdirectory key
 const TYPE_HARNESS_MAP = {
-  skill: { cursor: 'skills', claude: 'skills', codex: 'skills' },
-  agent: { cursor: 'agents', claude: 'agents', codex: 'agents' },
-  rule: { cursor: 'rules' },
-  hook: { cursor: 'hooks', claude: 'hooks' },
+  skill:   { cursor: 'skills',   claude: 'skills',   codex: 'skills' },
+  agent:   { cursor: 'agents',   claude: 'agents',   codex: 'agents' },
+  rule:    { cursor: 'rules' },
+  hook:    { cursor: 'hooks',    claude: 'hooks' },
+  command: { claude: 'commands' },
 };
 
 const CATALOG_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -397,7 +400,7 @@ function scanSkills(dir, out, skipBuckets) {
 }
 
 function discoverSource(sourceDir) {
-  const result = { skills: [], agents: [], rules: [], hooks: [], hasCLAUDEMd: false };
+  const result = { skills: [], agents: [], rules: [], hooks: [], commands: [], hasCLAUDEMd: false };
   if (!fs.existsSync(sourceDir)) return result;
 
   // Skills: recursively walk skills/ for any directory containing SKILL.md.
@@ -445,6 +448,22 @@ function discoverSource(sourceDir) {
       }
     }
   }
+
+  // Commands: .md and .toml files in commands/ or .claude/commands/ (slash commands for Claude Code)
+  function scanCommandsDir(dir) {
+    if (!fs.existsSync(dir)) return;
+    for (const file of fs.readdirSync(dir)) {
+      if (file === 'README.md') continue;
+      if (file.endsWith('.md') || file.endsWith('.toml')) {
+        const name = file.replace(/\.(md|toml)$/, '');
+        if (!result.commands.find((c) => c.name === name)) {
+          result.commands.push({ name, path: path.join(dir, file) });
+        }
+      }
+    }
+  }
+  scanCommandsDir(path.join(sourceDir, 'commands'));
+  scanCommandsDir(path.join(sourceDir, '.claude', 'commands'));
 
   // CLAUDE.md
   if (fs.existsSync(path.join(sourceDir, 'CLAUDE.md'))) {
@@ -511,8 +530,8 @@ function linkItemToHarnesses(item, harnesses, harnessDirs) {
     const targetDir = harnessBase[subdirKey];
     if (!targetDir) continue;
 
-    // For rules (.mdc files) the dest is file, not dir
-    const isFile = item.type === 'rule' || (item.type === 'agent' && !fs.lstatSync(item.srcPath).isDirectory());
+    // For rules (.mdc files) and commands (.md/.toml files) the dest is file, not dir
+    const isFile = item.type === 'rule' || item.type === 'command' || (item.type === 'agent' && !fs.lstatSync(item.srcPath).isDirectory());
     const destName = isFile ? path.basename(item.srcPath) : item.name;
     const destPath = path.join(targetDir, destName);
     destPaths[harness] = destPath;
@@ -600,6 +619,11 @@ async function cloneOrPullSource(sourceName, repoUrl, ref = 'main') {
   mkdirp(SOURCES_DIR);
 
   if (fs.existsSync(destDir)) {
+    const state = readState();
+    if (state.pins?.[sourceName]) {
+      info(`${sourceName} is pinned to ${state.pins[sourceName].slice(0, 7)} — skipping update`);
+      return { action: 'pinned', dir: destDir };
+    }
     // Edge case #3: warn on local changes
     const statusResult = git(['status', '--porcelain'], destDir);
     if (statusResult.stdout.trim()) {
@@ -651,6 +675,7 @@ async function applyLinks(sourceName, harnesses, scopeCtx, filterItem = null) {
     ...discovered.agents.map((a) => ({ ...a, type: 'agent', srcPath: a.path })),
     ...discovered.rules.map((r) => ({ ...r, type: 'rule', srcPath: r.path })),
     ...discovered.hooks.map((h) => ({ ...h, type: 'hook', srcPath: h.path })),
+    ...discovered.commands.map((c) => ({ ...c, type: 'command', srcPath: c.path })),
   ];
 
   for (const item of allItems) {
@@ -1153,6 +1178,7 @@ async function cmdList(args) {
       const parts = [];
       if (d.skills.length) parts.push(`${d.skills.length} skills`);
       if (d.agents.length) parts.push(`${d.agents.length} agents`);
+      if (d.commands.length) parts.push(`${d.commands.length} commands`);
       if (d.rules.length) parts.push(`${d.rules.length} rules`);
       if (d.hooks.length) parts.push(`${d.hooks.length} hooks`);
       if (d.hasCLAUDEMd) parts.push('CLAUDE.md');
@@ -1218,6 +1244,10 @@ async function cmdList(args) {
     if (discovered.rules.length) {
       console.log(`    ${C.cyan}Rules (${discovered.rules.length}):${C.reset}`);
       discovered.rules.forEach((r) => console.log(`      ${name}/${r.name}`));
+    }
+    if (discovered.commands.length) {
+      console.log(`    ${C.cyan}Commands (${discovered.commands.length}):${C.reset}`);
+      discovered.commands.forEach((c) => console.log(`      ${name}/${c.name}`));
     }
     if (discovered.hooks.length) {
       console.log(`    ${C.cyan}Hooks (${discovered.hooks.length}):${C.reset}`);
@@ -1338,6 +1368,141 @@ async function cmdUninstall(args) {
   console.log(`\n${C.green}${C.bold}ADT fully uninstalled.${C.reset}`);
 }
 
+// ─── Command: info ────────────────────────────────────────────────────────────
+
+async function cmdInfo(args) {
+  const name = args[0];
+  if (!name) { console.log('\nUsage: adt info <source>\n'); process.exit(1); }
+  const catalog = await getCatalog();
+  const src = catalog[name];
+  if (!src) { err(`Unknown source: ${name}`); process.exit(1); }
+
+  header(`ADT — info: ${name}`);
+
+  const state = readState();
+  const pins = state.pins || {};
+  const sourceDir = getSourceDir(name);
+  const cloned = fs.existsSync(sourceDir);
+
+  console.log(`\n  ${C.bold}${name}${C.reset}`);
+  if (src.label) info(src.label);
+  console.log(`  ${C.bold}Repo:${C.reset}   ${src.repo}`);
+  console.log(`  ${C.bold}Ref:${C.reset}    ${src.ref || 'main'}`);
+  if (pins[name]) console.log(`  ${C.bold}Pinned:${C.reset} ${C.yellow}${pins[name].slice(0, 7)}${C.reset}`);
+
+  if (!cloned) {
+    console.log(`\n  ${C.dim}Not installed. Run: adt install ${name}${C.reset}`);
+    return;
+  }
+
+  const localHead = git(['rev-parse', 'HEAD'], sourceDir).stdout.trim();
+  const lastDate = git(['log', '-1', '--format=%ci'], sourceDir).stdout.trim().slice(0, 10);
+  console.log(`  ${C.bold}Local:${C.reset}  ${localHead.slice(0, 7)} (${lastDate})`);
+
+  const d = discoverSource(sourceDir);
+  const parts = [];
+  if (d.skills.length) parts.push(`${d.skills.length} skills`);
+  if (d.agents.length) parts.push(`${d.agents.length} agents`);
+  if (d.commands.length) parts.push(`${d.commands.length} commands`);
+  if (d.rules.length) parts.push(`${d.rules.length} rules`);
+  if (d.hooks.length) parts.push(`${d.hooks.length} hooks`);
+  if (d.hasCLAUDEMd) parts.push('CLAUDE.md');
+  console.log(`\n  ${C.bold}Contents:${C.reset} ${parts.join(', ') || 'empty'}`);
+
+  const manifest = readManifest();
+  const globalItems = manifest.items.filter((i) => i.source === name && i.scope === 'global');
+  const scope = detectScope(process.cwd());
+  const projectItems = scope.kind === 'project'
+    ? manifest.items.filter((i) => i.source === name && i.scope === 'project' && i.projectRoot === scope.root)
+    : [];
+
+  console.log(`\n  ${C.bold}Active:${C.reset}`);
+  if (globalItems.length) console.log(`    ${C.green}global${C.reset}  — ${globalItems.length} item(s)`);
+  if (projectItems.length) console.log(`    ${C.green}project${C.reset} — ${projectItems.length} item(s) (${scope.root})`);
+  if (!globalItems.length && !projectItems.length) console.log(`    ${C.dim}not active — run: adt use ${name}${C.reset}`);
+}
+
+// ─── Command: outdated ────────────────────────────────────────────────────────
+
+async function cmdOutdated() {
+  header('ADT — outdated');
+  const catalog = await getCatalog();
+  const state = readState();
+  const pins = state.pins || {};
+
+  const installed = Object.keys(catalog).filter((n) => fs.existsSync(getSourceDir(n)));
+  if (installed.length === 0) {
+    info('No sources installed. Run: adt install <source>');
+    return;
+  }
+
+  let anyOutdated = false;
+  for (const name of installed) {
+    const src = catalog[name];
+    if (!src) continue;
+    if (pins[name]) {
+      console.log(`  ${C.dim}${name}${C.reset} ${C.yellow}pinned${C.reset} ${C.dim}(${pins[name].slice(0, 7)})${C.reset}`);
+      continue;
+    }
+    const sourceDir = getSourceDir(name);
+    const localHead = git(['rev-parse', 'HEAD'], sourceDir).stdout.trim();
+    const ref = src.ref || 'main';
+    const remoteResult = git(['ls-remote', 'origin', ref], sourceDir);
+    const remoteHead = remoteResult.stdout.trim().split('\t')[0];
+    if (remoteHead && localHead !== remoteHead) {
+      console.log(`  ${C.yellow}${name}${C.reset}  ${localHead.slice(0, 7)} → ${remoteHead.slice(0, 7)}`);
+      anyOutdated = true;
+    } else {
+      console.log(`  ${C.dim}${name}${C.reset} ${C.dim}up to date (${localHead.slice(0, 7)})${C.reset}`);
+    }
+  }
+  if (anyOutdated) {
+    console.log(`\n  Run ${C.cyan}adt update${C.reset} to pull updates.`);
+  } else {
+    console.log(`\n  ${C.green}All sources up to date.${C.reset}`);
+  }
+}
+
+// ─── Command: pin / unpin ─────────────────────────────────────────────────────
+
+async function cmdPin(args) {
+  const name = args[0];
+  if (!name) { console.log('\nUsage: adt pin <source> [ref]\n'); process.exit(1); }
+  const catalog = await getCatalog();
+  if (!catalog[name]) { err(`Unknown source: ${name}`); process.exit(1); }
+  const sourceDir = getSourceDir(name);
+  if (!fs.existsSync(sourceDir)) {
+    err(`Source not installed: ${name}. Run: adt install ${name}`);
+    process.exit(1);
+  }
+
+  const ref = args[1];
+  let sha;
+  if (ref) {
+    const r = git(['rev-parse', ref], sourceDir);
+    if (r.code !== 0) { err(`Could not resolve ref "${ref}": ${r.stderr.trim()}`); process.exit(1); }
+    sha = r.stdout.trim();
+  } else {
+    sha = git(['rev-parse', 'HEAD'], sourceDir).stdout.trim();
+  }
+
+  const state = readState();
+  state.pins = state.pins || {};
+  state.pins[name] = sha;
+  writeState(state);
+  ok(`${name} pinned to ${sha.slice(0, 7)}`);
+}
+
+async function cmdUnpin(args) {
+  const name = args[0];
+  if (!name) { console.log('\nUsage: adt unpin <source>\n'); process.exit(1); }
+  const state = readState();
+  if (!state.pins?.[name]) { info(`${name} is not pinned.`); return; }
+  delete state.pins[name];
+  writeState(state);
+  ok(`${name} unpinned`);
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 const [,, cmd, ...rest] = process.argv;
@@ -1354,6 +1519,10 @@ const [,, cmd, ...rest] = process.argv;
       case 'update':    await cmdUpdate(); break;
       case 'list':      await cmdList(rest); break;
       case 'status':    await cmdStatus(); break;
+      case 'info':      await cmdInfo(rest); break;
+      case 'outdated':  await cmdOutdated(); break;
+      case 'pin':       await cmdPin(rest); break;
+      case 'unpin':     await cmdUnpin(rest); break;
       case 'uninstall': await cmdUninstall(rest); break;
       default:
         console.log(`
@@ -1387,6 +1556,10 @@ ${C.cyan}Inspect:${C.reset}
   adt list --global                 Show globally-active items
   adt list --project                Show items active in the current project
   adt status                        Show scope + active items (global + project)
+  adt info <source>                 Show metadata, contents, and activation status
+  adt outdated                      Show sources with available upstream updates
+  adt pin <source> [ref]            Lock a source to its current commit (or a ref)
+  adt unpin <source>                Remove the pin from a source
 
 ${C.cyan}Uninstall:${C.reset}
   adt uninstall                     Interactive: remove everything ADT created
